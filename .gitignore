@@ -1,7 +1,9 @@
 /target
 /data
+/lemmy-scraper.log
 
 .idea/
 .vscode/
 
 .DS_Store
+.env

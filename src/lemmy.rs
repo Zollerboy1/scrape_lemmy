@@ -67,12 +67,11 @@ impl LemmyCommunityId {
         let client = if community.instance_id == main_instance.instance_info().id {
             main_instance.client()
         } else {
-            match instances
-                .get(&community.instance_id)
-                .ok_or(Error::InstanceNotFound)?
-                .get()
-                .await
-            {
+            let Some(instance) = instances.get(&community.instance_id) else {
+                return Ok(None);
+            };
+
+            match instance.get().await {
                 Ok(instance) => &instance.client,
                 Err(_) => return Ok(None), // Instance is not reachable
             }

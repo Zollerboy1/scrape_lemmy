@@ -1,12 +1,13 @@
 use std::{
-    collections::HashMap, net::ToSocketAddrs as _, num::NonZeroU32, sync::Arc, time::Duration,
+    collections::HashMap, convert::identity, net::ToSocketAddrs as _, num::NonZeroU32, sync::Arc,
+    time::Duration,
 };
 
 use async_once_cell::Lazy;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::{
-    future::{self, LocalBoxFuture},
+    future::{self, try_join_all, LocalBoxFuture},
     stream, FutureExt as _, StreamExt as _, TryStreamExt as _,
 };
 use governor::{Jitter, Quota, RateLimiter};
@@ -28,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use crate::{
     cli::Cli,
     error::{Error, LemmyError, Result},
-    ext::{HasInner as _, IntoStream as _, StreamExt as _, TryStreamExt as _},
+    ext::{HasInner as _, StreamExt as _, TryStreamExt as _},
     lemmy::{
         LemmyComment, LemmyCommunityId, LemmyInstanceInfo, LemmyPost, LemmyPostId, LemmyUser,
         LemmyUserId,
@@ -70,7 +71,6 @@ path!(
     GetPersonDetailsResponse
 );
 
-
 const USER_AGENT: &str = concat!(
     env!("CARGO_PKG_NAME"),
     "/",
@@ -89,7 +89,9 @@ pub struct LemmyClient {
 
 impl LemmyClient {
     fn build_reqwest_client(domain: &str) -> Result<Client> {
-        let sock_addrs = format!("{}:443", domain).to_socket_addrs()?.collect::<Vec<_>>();
+        let sock_addrs = format!("{}:443", domain)
+            .to_socket_addrs()?
+            .collect::<Vec<_>>();
         Client::builder()
             .resolve_to_addrs(domain, &sock_addrs)
             .user_agent(USER_AGENT)
@@ -220,8 +222,9 @@ impl LemmyClient {
             self.retry(url, n_retries).await
         } else {
             log!(
-                "[{}] Invalid response: {}",
+                "[{}] Invalid response (Request: {}): {}",
                 self.domain,
+                url.as_str(),
                 String::from_utf8_lossy(&bytes)
             );
 
@@ -501,20 +504,22 @@ impl MainInstance {
             auth: None,
         };
 
-        self.client
-            .get_with_params(ListCommunitiesPath, params)
-            .await?
-            .communities
-            .into_stream()
-            .map(|view| async move {
-                LemmyCommunityId::try_from(&view.community, self, instances)
-                    .await
-                    .map_inner(|id| (id, view))
-            })
-            .buffer_unordered(200)
-            .try_filter_map(|x| future::ready(Ok(x)))
-            .try_collect()
-            .await
+        Ok(try_join_all(
+            self.client
+                .get_with_params(ListCommunitiesPath, params)
+                .await?
+                .communities
+                .into_iter()
+                .map(|view| async move {
+                    LemmyCommunityId::try_from(&view.community, self, instances)
+                        .await
+                        .map_inner(|id| (id, view))
+                }),
+        )
+        .await?
+        .into_iter()
+        .filter_map(identity)
+        .collect())
     }
 }
 

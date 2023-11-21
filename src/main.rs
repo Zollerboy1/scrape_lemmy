@@ -28,7 +28,6 @@ use futures::{
     TryFutureExt as _,
 };
 use indexmap::IndexMap;
-use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools as _;
 use lemmy_api_common::person::Login;
 use scc::HashSet;
@@ -39,11 +38,14 @@ use crate::{
     ext::{IntoStream as _, StreamExt as _, TryStreamExt as _},
     instance::{Instance, LazyForeignInstance, MainInstance},
     lemmy::{CommunityByActivity, LemmyCommunity, MaybeLemmyUser},
+    log::Logger
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Arc::new(Cli::parse());
+
+    Logger::initialize(cli.logfile()?);
 
     // Set up main client
     let login = Login {
@@ -70,26 +72,21 @@ async fn main() -> Result<()> {
 
     log!("Instances: {}", instances.len() + 1);
 
-    let communities_bar: Arc<_> = ProgressBar::new_spinner()
-        .with_style(ProgressStyle::with_template("{msg} {spinner:.gray} {pos:<3.green}").unwrap())
-        .with_message("Fetching communities")
-        .into();
-    log::set_progress_bar(communities_bar.clone());
+    let communities_bar = Logger::create_progress_spinner("Fetching communities");
 
     let communities = (1..)
         .into_stream()
         .map(|page| main_instance.get_communities(page, &instances))
-        .buffer_max_concurrent(100)
+        .buffer_max_concurrent(20)
         .try_take_while(|c| future::ready(Ok(!c.is_empty())))
-        .inspect_ok(|_| communities_bar.inc(1))
+        .inspect_ok(|_| communities_bar.inc())
         .flatten_ok()
         .try_collect::<Vec<_>>()
         .await?
-        .into_stream()
+        .into_iter()
         .map(CommunityByActivity::from)
-        .filter(|c| future::ready(c.activity() > 0))
+        .filter(|c| c.activity() > 0)
         .collect::<BinaryHeap<_>>()
-        .await
         .into_iter_sorted()
         .take(10_000)
         .map(|c| {
@@ -99,7 +96,6 @@ async fn main() -> Result<()> {
         .collect::<IndexMap<_, _>>();
 
     communities_bar.finish();
-    log::clear_progress_bar();
 
     log!("Communities: {}", communities.len());
 
@@ -110,11 +106,7 @@ async fn main() -> Result<()> {
 
     let overestimated_post_count = communities.values().map(|(_, c)| c).sum();
 
-    let posts_bar: Arc<_> = ProgressBar::new(overestimated_post_count)
-        .with_style(ProgressStyle::with_template("{msg} {wide_bar} {pos}/{len}").unwrap())
-        .with_message("Fetching posts")
-        .into();
-    log::set_progress_bar(posts_bar.clone());
+    let posts_bar = Logger::create_progress_bar(overestimated_post_count, "Fetching posts");
 
     let posts = communities
         .iter()
@@ -130,7 +122,7 @@ async fn main() -> Result<()> {
             let main_instance = &main_instance;
             let instances = &instances;
             let user_ids = &user_ids;
-            let posts_bar = posts_bar.clone();
+            let posts_bar = &posts_bar;
 
             async move {
                 let posts = stream::iter(1..=pages)
@@ -153,29 +145,20 @@ async fn main() -> Result<()> {
                     .try_take_while(|posts| future::ready(Ok(posts.is_some())))
                     .try_filter_map(|x| future::ready(Ok(x)))
                     .flatten_ok()
-                    .and_then(|(p, c)| {
-                        let posts_bar = posts_bar.clone();
-                        async move {
-                            posts_bar.inc(1);
+                    .and_then(|(p, c)| async move {
+                        posts_bar.inc();
 
-                            if let Some(id) = p.creator_id().cloned() {
-                                _ = user_ids.insert_async(id).await;
-                            }
-
-                            Ok((p, c))
+                        if let Some(id) = p.creator_id().cloned() {
+                            _ = user_ids.insert_async(id).await;
                         }
+
+                        Ok((p, c))
                     })
                     .try_collect::<Vec<_>>()
                     .await?;
 
                 let correction = post_count - posts.len() as u64;
-                posts_bar.update(|state| {
-                    let Some(previous_len) = state.len() else {
-                        return;
-                    };
-
-                    state.set_len(previous_len - correction);
-                });
+                posts_bar.reduce_len(correction);
 
                 Ok::<_, Error>(posts)
             }
@@ -187,7 +170,6 @@ async fn main() -> Result<()> {
         .await?;
 
     posts_bar.finish();
-    log::clear_progress_bar();
 
     log!("Posts: {}", posts.len());
 
@@ -209,19 +191,14 @@ async fn main() -> Result<()> {
         .map(|(id, (_, c))| (id.community_id.instance_id, (id, *c)))
         .into_group_map();
 
-    let comments_bar: Arc<_> = ProgressBar::new(posts.len() as u64)
-        .with_style(ProgressStyle::with_template("{msg} {wide_bar} {pos}/{len}").unwrap())
-        .with_message("Fetching comments")
-        .into();
-    log::set_progress_bar(comments_bar.clone());
+    let comments_bar = Logger::create_progress_bar(posts.len() as u64, "Fetching comments");
 
     let comment_chunks =
         try_join_all(posts_per_instance.into_iter().map(|(instance_id, posts)| {
-            let comments_bar = comments_bar.clone();
-
             let main_instance = &main_instance;
             let instances = &instances;
             let user_ids = &user_ids;
+            let comments_bar = &comments_bar;
 
             async move {
                 stream::iter(posts)
@@ -239,7 +216,7 @@ async fn main() -> Result<()> {
                         }
                     })
                     .buffer_unordered(50)
-                    .inspect_ok(|_| comments_bar.inc(1))
+                    .inspect_ok(|_| comments_bar.inc())
                     .flatten_ok()
                     .and_then(|c| async move {
                         if let Some(id) = c.creator_id().cloned() {
@@ -269,15 +246,10 @@ async fn main() -> Result<()> {
     };
 
     comments_bar.finish();
-    log::clear_progress_bar();
 
     log!("Comments: {}", comment_count);
 
-    let users_bar: Arc<_> = ProgressBar::new(user_ids.len() as u64)
-        .with_style(ProgressStyle::with_template("{msg} {wide_bar} {pos}/{len}").unwrap())
-        .with_message("Fetching users")
-        .into();
-    log::set_progress_bar(users_bar.clone());
+    let users_bar = Logger::create_progress_bar(user_ids.len() as u64, "Fetching users");
 
     let future_users = {
         let mut future_users = HashMap::new();
@@ -315,13 +287,12 @@ async fn main() -> Result<()> {
             })
         })
         .buffer_unordered(200)
-        .inspect_ok(|_| users_bar.inc(1))
+        .inspect_ok(|_| users_bar.inc())
         .try_collect::<HashMap<_, _>>()
         .await?;
 
     users_bar.finish();
-    log::clear_progress_bar();
-
+    
     log!("Users: {}", users.len());
 
     for (i, chunk) in users.values().chunks(100_000).into_iter().enumerate() {

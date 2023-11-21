@@ -34,6 +34,11 @@ pub struct Cli {
     /// The maximum number of times to retry a failed request
     #[arg(long, value_name = "NUM", default_value_t = 3u8)]
     pub max_retries: u8,
+    /// The log file to write to
+    /// 
+    /// Defaults to `lemmy-scraper.log` in the current directory
+    #[arg(long, value_name = "FILE")]
+    logfile: Option<PathBuf>,
 }
 
 impl Cli {
@@ -42,6 +47,13 @@ impl Cli {
             self.start_date,
             NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
         )
+    }
+
+    pub fn logfile(&self) -> Result<PathBuf> {
+        Ok(self.logfile
+            .as_ref()
+            .unwrap_or(&current_dir()?.join("lemmy-scraper.log"))
+            .to_owned())
     }
 }
 
