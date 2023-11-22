@@ -63,6 +63,15 @@ impl Cli {
         I: IntoIterator,
         I::Item: Serialize,
     {
+        let file_path = match self.output_dir.as_ref() {
+            Some(dir_path) => dir_path.join(filename),
+            None => {
+                let dir_path = current_dir()?.join("data");
+                fs::create_dir_all(&dir_path).await?;
+                dir_path.join(filename)
+            }
+        };
+
         let mut writer = Writer::from_writer(vec![]);
 
         for record in records {
@@ -70,16 +79,6 @@ impl Cli {
         }
 
         let data = writer.into_inner().map_err(|_| Error::CsvWriteFailed)?;
-
-        let dir_path = self
-            .output_dir
-            .as_ref()
-            .unwrap_or(&current_dir()?)
-            .join("data");
-
-        fs::create_dir_all(&dir_path).await?;
-
-        let file_path = dir_path.join(filename);
 
         File::create(file_path)
             .await?

@@ -14,7 +14,8 @@ use serde::Serialize;
 
 use crate::{
     error::{Error, Result},
-    instance::{GetCommunityPath, Instance, LazyForeignInstance},
+    instance::{GetCommunityPath, Instance, LazyForeignInstance, MainInstance},
+    log,
 };
 
 serde_with::with_prefix!(prefix_community "community_");
@@ -61,18 +62,21 @@ impl LemmyCommunityId {
 
     pub async fn try_from(
         community: &Community,
-        main_instance: &impl Instance,
+        main_instance: &MainInstance,
         instances: &HashMap<InstanceId, LazyForeignInstance<'_>>,
     ) -> Result<Option<Self>> {
-        let client = if community.instance_id == main_instance.instance_info().id {
-            main_instance.client()
+        let (client, domain) = if community.instance_id == main_instance.instance_info.id {
+            (
+                main_instance.client(),
+                main_instance.instance_info.domain.as_ref(),
+            )
         } else {
             let Some(instance) = instances.get(&community.instance_id) else {
                 return Ok(None);
             };
 
             match instance.get().await {
-                Ok(instance) => &instance.client,
+                Ok(instance) => (&instance.client, instance.instance_info.domain.as_ref()),
                 Err(_) => return Ok(None), // Instance is not reachable
             }
         };
@@ -83,12 +87,18 @@ impl LemmyCommunityId {
             auth: None,
         };
 
-        let foreign_id = client
+        let foreign_id = match client
             .get_with_params(GetCommunityPath, params)
-            .await?
-            .community_view
-            .community
-            .id;
+            .await
+            .map(|res| res.community_view.community.id)
+        {
+            Ok(id) => id,
+            Err(Error::Lemmy(_)) | Err(Error::LemmyBug) => {
+                log!("[{}] Community not found: {}", domain, community.name);
+                return Ok(None);
+            }
+            Err(err) => return Err(err),
+        };
 
         Ok(Some(LemmyCommunityId::new(
             community.id,

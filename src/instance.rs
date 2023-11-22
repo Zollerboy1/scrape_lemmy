@@ -1,16 +1,15 @@
 use std::{
-    collections::HashMap, convert::identity, net::ToSocketAddrs as _, num::NonZeroU32, sync::Arc,
-    time::Duration,
+    collections::HashMap, net::ToSocketAddrs as _, num::NonZeroU32, sync::Arc, time::Duration, cmp::min,
 };
 
 use async_once_cell::Lazy;
 use async_recursion::async_recursion;
 use async_trait::async_trait;
 use futures::{
-    future::{self, try_join_all, LocalBoxFuture},
+    future::{self, LocalBoxFuture},
     stream, FutureExt as _, StreamExt as _, TryStreamExt as _,
 };
-use governor::{Jitter, Quota, RateLimiter};
+use governor::{DefaultDirectRateLimiter, Jitter, Quota, RateLimiter};
 use lemmy_api_common::{
     comment::{GetComments, GetCommentsResponse},
     community::{GetCommunity, GetCommunityResponse, ListCommunities, ListCommunitiesResponse},
@@ -29,7 +28,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use crate::{
     cli::Cli,
     error::{Error, LemmyError, Result},
-    ext::{HasInner as _, StreamExt as _, TryStreamExt as _},
+    ext::{StreamExt as _, TryStreamExt as _},
     lemmy::{
         LemmyComment, LemmyCommunityId, LemmyInstanceInfo, LemmyPost, LemmyPostId, LemmyUser,
         LemmyUserId,
@@ -82,8 +81,9 @@ const USER_AGENT: &str = concat!(
 pub struct LemmyClient {
     cli: Arc<Cli>,
     domain: Arc<str>,
+    rate_limiter: Arc<RwLock<DefaultDirectRateLimiter>>,
+    quota: Quota,
     tx: mpsc::UnboundedSender<(Request, oneshot::Sender<Result<Response, ReqwestError>>)>,
-    retry_lock: Arc<RwLock<()>>,
     jwt: Option<Sensitive<String>>,
 }
 
@@ -117,8 +117,8 @@ impl LemmyClient {
         );
 
         let Some(quota) = (try {
-            let maximum_cells = (maximum_cells / 6 + 1) as u32; // Let's be conservative here
-            let max_burst = NonZeroU32::new(maximum_cells)?;
+            let maximum_cells = (maximum_cells / 2 + 1) as u32; // Let's be conservative here
+            let max_burst = NonZeroU32::new(min(maximum_cells, 20))?;
 
             let period = Duration::from_secs(secs_to_refill as u64) / maximum_cells;
 
@@ -127,15 +127,14 @@ impl LemmyClient {
             do yeet Error::InvalidRateLimit;
         };
 
-        let rate_limiter = Arc::new(RateLimiter::direct(quota));
+        let rate_limiter = Arc::new(RwLock::new(RateLimiter::direct(quota)));
 
         let (tx, rx) =
             mpsc::unbounded_channel::<(Request, oneshot::Sender<Result<Response, ReqwestError>>)>();
 
-        let retry_lock = Arc::new(RwLock::new(()));
-
         {
-            let retry_lock = retry_lock.clone();
+            let rate_limiter = rate_limiter.clone();
+            let domain = domain.clone();
 
             tokio::spawn(async move {
                 let client = client;
@@ -144,18 +143,22 @@ impl LemmyClient {
                 let jitter = Jitter::up_to(Duration::from_secs(2));
 
                 while let Some((req, tx)) = rx.recv().await {
-                    rate_limiter.until_ready_with_jitter(jitter).await;
+                    rate_limiter
+                        .read()
+                        .await
+                        .until_ready_with_jitter(jitter)
+                        .await;
+
+                    log!(
+                        trace,
+                        "[{}] Request: {}",
+                        domain,
+                        Self::url_to_string(req.url())
+                    );
 
                     let client = client.clone();
-                    let rate_limiter = rate_limiter.clone();
-                    let retry_lock = retry_lock.clone();
 
                     tokio::spawn(async move {
-                        if retry_lock.try_read().is_err() {
-                            _ = retry_lock.read().await;
-                            rate_limiter.until_ready_with_jitter(jitter).await;
-                        }
-
                         _ = tx.send(client.execute(req).await);
                     });
                 }
@@ -165,8 +168,9 @@ impl LemmyClient {
         Ok(LemmyClient {
             cli,
             domain,
+            rate_limiter,
+            quota,
             tx,
-            retry_lock,
             jwt,
         })
     }
@@ -217,18 +221,26 @@ impl LemmyClient {
             Err(Error::from(lemmy_error))
         } else if let Ok(res) = serde_json::from_slice::<R>(&bytes) {
             Ok(res)
-        } else if bytes == "{}".as_bytes() {
-            log!("[{}] Rate limit hit: {}", self.domain, url.as_str());
-            self.retry(url, n_retries).await
         } else {
-            log!(
-                "[{}] Invalid response (Request: {}): {}",
-                self.domain,
-                url.as_str(),
-                String::from_utf8_lossy(&bytes)
-            );
-
-            self.retry(url, n_retries).await
+            match bytes.as_ref() {
+                b"{}" => {
+                    log!("[{}] Rate limit hit: {}", self.domain, url.as_str());
+                    self.retry(url, n_retries).await
+                }
+                b"Timeout occurred while waiting for a slot to become available" => {
+                    Err(Error::LemmyBug)
+                }
+                _ => {
+                    log!(
+                        "[{}] Invalid response (Request: {}): {}",
+                        self.domain,
+                        Self::url_to_string(&url),
+                        String::from_utf8_lossy(&bytes)
+                    );
+    
+                    self.retry(url, n_retries).await
+                }
+            }
         }
     }
 
@@ -240,8 +252,9 @@ impl LemmyClient {
             let delay = Duration::from_secs(2u64.pow((n_retries + 2) as u32));
             log!("[{}] Trying again in {:?}", self.domain, delay);
 
-            let write_guard = self.retry_lock.write().await;
+            let mut write_guard = self.rate_limiter.write().await;
             tokio::time::sleep(delay).await;
+            *write_guard = RateLimiter::direct(self.quota);
             std::mem::drop(write_guard);
 
             self.get_impl(url, n_retries + 1).await
@@ -268,6 +281,12 @@ impl LemmyClient {
         }
 
         Ok(url)
+    }
+
+    fn url_to_string(url: &Url) -> String {
+        url.query().map_or(url.path().to_string(), |query| {
+            format!("{}?{}", url.path(), query)
+        })
     }
 }
 
@@ -490,11 +509,7 @@ impl MainInstance {
         })
     }
 
-    pub async fn get_communities(
-        &self,
-        page: u64,
-        instances: &HashMap<InstanceId, LazyForeignInstance<'_>>,
-    ) -> Result<Vec<(LemmyCommunityId, CommunityView)>> {
+    pub async fn get_community_views(&self, page: u64) -> Result<Vec<CommunityView>> {
         let params = ListCommunities {
             type_: Some(ListingType::All),
             sort: Some(SortType::TopAll),
@@ -504,22 +519,11 @@ impl MainInstance {
             auth: None,
         };
 
-        Ok(try_join_all(
-            self.client
-                .get_with_params(ListCommunitiesPath, params)
-                .await?
-                .communities
-                .into_iter()
-                .map(|view| async move {
-                    LemmyCommunityId::try_from(&view.community, self, instances)
-                        .await
-                        .map_inner(|id| (id, view))
-                }),
-        )
-        .await?
-        .into_iter()
-        .filter_map(identity)
-        .collect())
+        Ok(self
+            .client
+            .get_with_params(ListCommunitiesPath, params)
+            .await?
+            .communities)
     }
 }
 

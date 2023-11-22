@@ -7,7 +7,7 @@ use serde::Deserialize;
 #[derive(Clone, Debug, Deserialize)]
 pub struct LemmyError {
     pub error: String,
-    pub reason: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -21,6 +21,7 @@ pub enum Error {
     SendFailed,
     RecvFailed,
     Lemmy(LemmyError),
+    LemmyBug,
     TooManyRetries,
     InstanceNotFound,
     InvalidCommentPath(String),

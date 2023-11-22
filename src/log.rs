@@ -46,7 +46,6 @@ impl Logger {
             ProgressBarImpl::new_spinner()
                 .with_style(ProgressStyle::with_template("{msg} {spinner} {pos}").unwrap())
                 .with_message(message)
-                .into()
         })
     }
 
@@ -74,12 +73,16 @@ impl Logger {
     }
 
     pub fn log(&self, str: impl AsRef<str>) {
-        self.tx.send(str.as_ref().to_string()).unwrap();
+        self.trace(&str);
         if let Some(progress_bar) = self.progress_bar.read().unwrap().as_ref() {
             progress_bar.println(str);
         } else {
             println!("{}", str.as_ref());
         }
+    }
+
+    pub fn trace(&self, str: impl AsRef<str>) {
+        self.tx.send(str.as_ref().to_string()).unwrap();
     }
 }
 
@@ -116,10 +119,10 @@ impl Drop for ProgressBar {
 
 #[macro_export]
 macro_rules! log {
-    () => {
-        $crate::log::Logger::get().log("")
+    (trace, $($arg:tt)+) => {
+        $crate::log::Logger::get().trace(format!($($arg)+))
     };
-    ($($arg:tt)*) => {
-        $crate::log::Logger::get().log(format!($($arg)*))
+    ($($arg:tt)+) => {
+        $crate::log::Logger::get().log(format!($($arg)+))
     };
 }

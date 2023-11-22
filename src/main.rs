@@ -28,17 +28,17 @@ use futures::{
     TryFutureExt as _,
 };
 use indexmap::IndexMap;
-use itertools::Itertools as _;
+use itertools::Itertools;
 use lemmy_api_common::person::Login;
 use scc::HashSet;
 
 use crate::{
     cli::Cli,
     error::{Error, Result},
-    ext::{IntoStream as _, StreamExt as _, TryStreamExt as _},
+    ext::{HasInner as _, IntoStream as _, StreamExt as _, TryStreamExt as _},
     instance::{Instance, LazyForeignInstance, MainInstance},
-    lemmy::{CommunityByActivity, LemmyCommunity, MaybeLemmyUser},
-    log::Logger
+    lemmy::{CommunityByActivity, LemmyCommunity, LemmyCommunityId, MaybeLemmyUser},
+    log::Logger,
 };
 
 #[tokio::main]
@@ -74,19 +74,54 @@ async fn main() -> Result<()> {
 
     let communities_bar = Logger::create_progress_spinner("Fetching communities");
 
-    let communities = (1..)
+    let community_views = (1..)
         .into_stream()
-        .map(|page| main_instance.get_communities(page, &instances))
+        .map(|page| main_instance.get_community_views(page))
         .buffer_max_concurrent(20)
         .try_take_while(|c| future::ready(Ok(!c.is_empty())))
         .inspect_ok(|_| communities_bar.inc())
         .flatten_ok()
+        .try_filter(|view| future::ready(view.counts.users_active_half_year > 0))
+        .map_ok(|view| (view.community.id, view))
         .try_collect::<Vec<_>>()
+        .await?;
+
+    let community_view_count = community_views.len();
+
+    let community_views_per_instance = community_views.into_iter().into_group_map();
+
+    communities_bar.finish();
+
+    log!("Communities: {}", community_view_count);
+
+    let communities_bar =
+        Logger::create_progress_bar(community_view_count as u64, "Filtering communities");
+
+    let communities = community_views_per_instance
+        .into_values()
+        .sorted_by_key(|views| views.len())
+        .rev()
+        .into_stream()
+        .map(|views| {
+            views
+                .into_stream()
+                .map(|view| {
+                    let main_instance = &main_instance;
+                    let instances = &instances;
+                    async move {
+                        LemmyCommunityId::try_from(&view.community, main_instance, instances)
+                            .await
+                            .map_inner(|id| (id, view))
+                    }
+                })
+                .buffer_unordered(20)
+                .flatten_ok()
+                .map_ok(CommunityByActivity::from)
+        })
+        .flatten_unordered(100)
+        .inspect_ok(|_| communities_bar.inc())
+        .try_collect::<BinaryHeap<_>>()
         .await?
-        .into_iter()
-        .map(CommunityByActivity::from)
-        .filter(|c| c.activity() > 0)
-        .collect::<BinaryHeap<_>>()
         .into_iter_sorted()
         .take(10_000)
         .map(|c| {
@@ -97,7 +132,7 @@ async fn main() -> Result<()> {
 
     communities_bar.finish();
 
-    log!("Communities: {}", communities.len());
+    log!("Filtered communities: {}", communities.len());
 
     cli.write_csv(communities.values().map(|(c, _)| c), "communities.csv")
         .await?;
@@ -141,7 +176,7 @@ async fn main() -> Result<()> {
                                 .await
                         }
                     })
-                    .buffer_max_concurrent(50)
+                    .buffer_max_concurrent(20)
                     .try_take_while(|posts| future::ready(Ok(posts.is_some())))
                     .try_filter_map(|x| future::ready(Ok(x)))
                     .flatten_ok()
@@ -292,7 +327,7 @@ async fn main() -> Result<()> {
         .await?;
 
     users_bar.finish();
-    
+
     log!("Users: {}", users.len());
 
     for (i, chunk) in users.values().chunks(100_000).into_iter().enumerate() {
