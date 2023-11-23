@@ -1,4 +1,4 @@
-use std::{io::Error as IoError, sync::Arc};
+use std::{io::Error as IoError, sync::Arc, fmt::Display};
 
 use csv::Error as CsvError;
 use reqwest::Error as ReqwestError;
@@ -24,11 +24,33 @@ pub enum Error {
     LemmyBug,
     TooManyRetries,
     InstanceNotFound,
-    InvalidCommentPath(String),
     ClientNotReady,
     Csv(Arc<CsvError>),
     CsvWriteFailed,
     Io(Arc<IoError>),
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self {
+            Error::Reqwest(error) => write!(f, "Reqwest error: {}", error),
+            Error::LoginFailed => write!(f, "Login failed"),
+            Error::InvalidRateLimit => write!(f, "Invalid rate limit"),
+            Error::GetInstancesFailed => write!(f, "Get instances failed"),
+            Error::InvalidUrl(url) => write!(f, "Invalid URL: {}", url),
+            Error::InvalidParams => write!(f, "Invalid params"),
+            Error::SendFailed => write!(f, "Send failed"),
+            Error::RecvFailed => write!(f, "Recv failed"),
+            Error::Lemmy(error) => write!(f, "Lemmy error: {}", error.error),
+            Error::LemmyBug => write!(f, "Lemmy bug"),
+            Error::TooManyRetries => write!(f, "Too many retries"),
+            Error::InstanceNotFound => write!(f, "Instance not found"),
+            Error::ClientNotReady => write!(f, "Client not ready"),
+            Error::Csv(error) => write!(f, "CSV error: {}", error),
+            Error::CsvWriteFailed => write!(f, "CSV write failed"),
+            Error::Io(error) => write!(f, "IO error: {}", error),
+        }
+    }
 }
 
 impl From<ReqwestError> for Error {

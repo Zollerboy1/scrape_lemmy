@@ -301,7 +301,7 @@ pub trait Instance: Sized {
         &self,
         community_id: LemmyCommunityId,
         page: u64,
-    ) -> Result<Option<Vec<(LemmyPost, u64)>>> {
+    ) -> Option<Vec<(LemmyPost, u64)>> {
         assert!(community_id.instance_id == self.instance_info().id);
 
         let params = GetPosts {
@@ -315,18 +315,23 @@ pub trait Instance: Sized {
             auth: None,
         };
 
-        let posts = self
+        let posts = match self
             .client()
             .get_with_params(ListPostsPath, params)
-            .await?
-            .posts;
+            .await {
+            Ok(res) => res.posts,
+            Err(e) => {
+                log!("[{}] Failed to get posts page {}: {}", self.instance_info().domain, page, e);
+                return Some(Vec::new());
+            }
+        };
 
         let start_date = self.cli().start_date();
 
         if posts.iter().all(|view| view.post.published < start_date) {
-            Ok(None)
+            None
         } else {
-            Ok(Some(
+            Some(
                 posts
                     .into_iter()
                     .filter(|view| {
@@ -340,7 +345,7 @@ pub trait Instance: Sized {
                         (LemmyPost::from(view, community_id, self), comment_count)
                     })
                     .collect(),
-            ))
+            )
         }
     }
 
@@ -348,7 +353,7 @@ pub trait Instance: Sized {
         &self,
         post_id: LemmyPostId,
         comment_count: u64,
-    ) -> Result<Vec<LemmyComment>> {
+    ) -> Vec<LemmyComment> {
         assert!(post_id.community_id.instance_id == self.instance_info().id);
 
         let common_params = GetComments {
@@ -408,19 +413,27 @@ pub trait Instance: Sized {
         };
 
         match res {
-            Ok(comments) => Ok(comments
+            Ok(comments) => comments
                 .into_iter()
-                .map(|view| LemmyComment::try_from(view, post_id, self))
-                .collect::<Result<_>>()?),
+                .map(|view| LemmyComment::from(view, post_id, self))
+                .collect(),
             Err(Error::Lemmy(e)) if e.error == "temporarily_disabled" => {
                 log!(
-                    "Comments for post {:?} temporarily disabled: {:?}",
+                    "Comments for post {:?} temporarily disabled: {}",
+                    post_id,
+                    Error::Lemmy(e)
+                );
+                Vec::new()
+            }
+            Err(e) => {
+                log!(
+                    "[{}] Failed to get comments for post {:?}: {}",
+                    self.instance_info().domain,
                     post_id,
                     e
                 );
-                Ok(Vec::new())
+                Vec::new()
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -509,7 +522,7 @@ impl MainInstance {
         })
     }
 
-    pub async fn get_community_views(&self, page: u64) -> Result<Vec<CommunityView>> {
+    pub async fn get_community_views(&self, page: u64) -> Vec<CommunityView> {
         let params = ListCommunities {
             type_: Some(ListingType::All),
             sort: Some(SortType::TopAll),
@@ -519,11 +532,16 @@ impl MainInstance {
             auth: None,
         };
 
-        Ok(self
+        match self
             .client
             .get_with_params(ListCommunitiesPath, params)
-            .await?
-            .communities)
+            .await {
+            Ok(res) => res.communities,
+            Err(e) => {
+                log!("[{}] Failed to get community views page {}: {}", self.instance_info.domain, page, e);
+                Vec::new()
+            }
+        }
     }
 }
 

@@ -13,7 +13,7 @@ use lemmy_api_common::{
 use serde::Serialize;
 
 use crate::{
-    error::{Error, Result},
+    error::Error,
     instance::{GetCommunityPath, Instance, LazyForeignInstance, MainInstance},
     log,
 };
@@ -64,7 +64,7 @@ impl LemmyCommunityId {
         community: &Community,
         main_instance: &MainInstance,
         instances: &HashMap<InstanceId, LazyForeignInstance<'_>>,
-    ) -> Result<Option<Self>> {
+    ) -> Option<Self> {
         let (client, domain) = if community.instance_id == main_instance.instance_info.id {
             (
                 main_instance.client(),
@@ -72,12 +72,15 @@ impl LemmyCommunityId {
             )
         } else {
             let Some(instance) = instances.get(&community.instance_id) else {
-                return Ok(None);
+                return None;
             };
 
             match instance.get().await {
                 Ok(instance) => (&instance.client, instance.instance_info.domain.as_ref()),
-                Err(_) => return Ok(None), // Instance is not reachable
+                _ => {
+                    log!(trace, "Instance not found: {:?}", community.instance_id);
+                    return None;
+                }
             }
         };
 
@@ -94,17 +97,25 @@ impl LemmyCommunityId {
         {
             Ok(id) => id,
             Err(Error::Lemmy(_)) | Err(Error::LemmyBug) => {
-                log!("[{}] Community not found: {}", domain, community.name);
-                return Ok(None);
+                log!(
+                    trace,
+                    "[{}] Community not found: {}",
+                    domain,
+                    community.name
+                );
+                return None;
             }
-            Err(err) => return Err(err),
+            Err(e) => {
+                log!("[{}] Error getting community: {}", domain, e);
+                return None;
+            }
         };
 
-        Ok(Some(LemmyCommunityId::new(
+        Some(LemmyCommunityId::new(
             community.id,
             community.instance_id,
             foreign_id,
-        )))
+        ))
     }
 }
 
@@ -410,30 +421,22 @@ impl LemmyComment {
         }
     }
 
-    pub fn try_from(
-        view: CommentView,
-        post_id: LemmyPostId,
-        instance: &impl Instance,
-    ) -> Result<Self> {
+    pub fn from(view: CommentView, post_id: LemmyPostId, instance: &impl Instance) -> Self {
         assert!(post_id.community_id.instance_id == instance.instance_info().id);
 
         let comment_id = view.comment.id;
         let path = view.comment.path;
 
-        let Some(parent_id) = (try {
+        let parent_id = try {
             let [comment_id_string, maybe_parent_id_string] =
                 path.split('.').rev().next_chunk().ok()?;
 
-            if comment_id_string.parse::<i32>().ok()? != comment_id.0 {
-                do yeet;
-            }
+            assert_eq!(comment_id_string.parse::<i32>().ok()?, comment_id.0);
 
             match maybe_parent_id_string {
-                "0" => None,
-                parent_id_string => Some(parent_id_string.parse().map(CommentId).ok()?),
+                "0" => do yeet,
+                parent_id_string => parent_id_string.parse().map(CommentId).ok()?,
             }
-        }) else {
-            do yeet Error::InvalidCommentPath(path);
         };
 
         let creator_id = instance
@@ -441,14 +444,14 @@ impl LemmyComment {
             .ok()
             .map(|id| LemmyUserId::new(view.creator.name, id));
 
-        Ok(LemmyComment::new(
+        LemmyComment::new(
             LemmyCommentId::new(view.comment.id, post_id),
             creator_id,
             view.comment.published,
             view.counts.score,
             view.counts.child_count as u32,
             parent_id,
-        ))
+        )
     }
 
     pub fn creator_id(&self) -> Option<&LemmyUserId> {

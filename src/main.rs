@@ -1,3 +1,4 @@
+#![feature(async_fn_in_trait)]
 #![feature(binary_heap_into_iter_sorted)]
 #![feature(const_option)]
 #![feature(iter_next_chunk)]
@@ -23,9 +24,9 @@ use std::{
 use clap::Parser as _;
 use dotenv_codegen::dotenv;
 use futures::{
-    future::{self, try_join_all},
-    stream::{self, StreamExt as _, TryStreamExt as _},
-    TryFutureExt as _,
+    future::{self, join_all},
+    stream,
+    StreamExt, FutureExt as _,
 };
 use indexmap::IndexMap;
 use itertools::Itertools;
@@ -34,18 +35,17 @@ use scc::HashSet;
 
 use crate::{
     cli::Cli,
-    error::{Error, Result},
-    ext::{HasInner as _, IntoStream as _, StreamExt as _, TryStreamExt as _},
+    ext::{IntoStream as _, StreamExt as _},
     instance::{Instance, LazyForeignInstance, MainInstance},
     lemmy::{CommunityByActivity, LemmyCommunity, LemmyCommunityId, MaybeLemmyUser},
     log::Logger,
 };
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     let cli = Arc::new(Cli::parse());
 
-    Logger::initialize(cli.logfile()?);
+    let _guard = Logger::initialize(cli.logfile());
 
     // Set up main client
     let login = Login {
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
     };
 
     let main_instance =
-        MainInstance::new(cli.clone(), dotenv!("LEMMY_DOMAIN").into(), login).await?;
+        MainInstance::new(cli.clone(), dotenv!("LEMMY_DOMAIN").into(), login).await.unwrap();
 
     log!("Fetching instances");
 
@@ -78,13 +78,13 @@ async fn main() -> Result<()> {
         .into_stream()
         .map(|page| main_instance.get_community_views(page))
         .buffer_max_concurrent(20)
-        .try_take_while(|c| future::ready(Ok(!c.is_empty())))
-        .inspect_ok(|_| communities_bar.inc())
-        .flatten_ok()
-        .try_filter(|view| future::ready(view.counts.users_active_half_year > 0))
-        .map_ok(|view| (view.community.id, view))
-        .try_collect::<Vec<_>>()
-        .await?;
+        .take_while(|c| future::ready(!c.is_empty()))
+        .inspect(|_| communities_bar.inc())
+        .flat_map(stream::iter)
+        .filter(|view| future::ready(view.counts.users_active_half_year > 0))
+        .map(|view| (view.community.id, view))
+        .collect::<Vec<_>>()
+        .await;
 
     let community_view_count = community_views.len();
 
@@ -111,17 +111,17 @@ async fn main() -> Result<()> {
                     async move {
                         LemmyCommunityId::try_from(&view.community, main_instance, instances)
                             .await
-                            .map_inner(|id| (id, view))
+                            .map(|id| (id, view))
                     }
                 })
                 .buffer_unordered(20)
-                .flatten_ok()
-                .map_ok(CommunityByActivity::from)
+                .flat_map(stream::iter)
+                .map(CommunityByActivity::from)
         })
-        .flatten_unordered(100)
-        .inspect_ok(|_| communities_bar.inc())
-        .try_collect::<BinaryHeap<_>>()
-        .await?
+        .flatten_unordered(200)
+        .inspect(|_| communities_bar.inc())
+        .collect::<BinaryHeap<_>>()
+        .await
         .into_iter_sorted()
         .take(10_000)
         .map(|c| {
@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
     log!("Filtered communities: {}", communities.len());
 
     cli.write_csv(communities.values().map(|(c, _)| c), "communities.csv")
-        .await?;
+        .await.unwrap();
 
     let user_ids = HashSet::new();
 
@@ -167,42 +167,50 @@ async fn main() -> Result<()> {
                                 .get_posts_and_comment_counts(community.id, page)
                                 .await
                         } else {
-                            instances
+                            let instance = match instances
                                 .get(&id.instance_id)
                                 .expect("Instances should be present")
                                 .get()
-                                .await?
+                                .await {
+                                Ok(instance) => instance,
+                                Err(_) => {
+                                    log!(trace, "Instance not found: {:?}", id.instance_id);
+                                    return Some(Vec::new())
+                                },
+                            };
+
+                            instance
                                 .get_posts_and_comment_counts(community.id, page)
                                 .await
                         }
                     })
                     .buffer_max_concurrent(20)
-                    .try_take_while(|posts| future::ready(Ok(posts.is_some())))
-                    .try_filter_map(|x| future::ready(Ok(x)))
-                    .flatten_ok()
-                    .and_then(|(p, c)| async move {
+                    .take_while(|posts| future::ready(posts.is_some()))
+                    .filter_map(future::ready)
+                    .flat_map(stream::iter)
+                    .then(|(p, c)| async move {
                         posts_bar.inc();
 
                         if let Some(id) = p.creator_id().cloned() {
                             _ = user_ids.insert_async(id).await;
                         }
 
-                        Ok((p, c))
+                        (p, c)
                     })
-                    .try_collect::<Vec<_>>()
-                    .await?;
+                    .collect::<Vec<_>>()
+                    .await;
 
-                let correction = post_count - posts.len() as u64;
-                posts_bar.reduce_len(correction);
+                let correction = posts.len() as i64 - *post_count as i64;
+                posts_bar.add_len(correction);
 
-                Ok::<_, Error>(posts)
+                posts
             }
         })
         .buffer_unordered(200)
-        .flatten_ok()
-        .map_ok(|(p, c)| (p.id, (p, c)))
-        .try_collect::<HashMap<_, _>>()
-        .await?;
+        .flat_map(stream::iter)
+        .map(|(p, c)| (p.id, (p, c)))
+        .collect::<HashMap<_, _>>()
+        .await;
 
     posts_bar.finish();
 
@@ -216,7 +224,7 @@ async fn main() -> Result<()> {
         .enumerate()
     {
         cli.write_csv(chunk, format!("posts_{}.csv", i).as_str())
-            .await?;
+            .await.unwrap();
     }
 
     log!("Users: {}", user_ids.len());
@@ -228,53 +236,61 @@ async fn main() -> Result<()> {
 
     let comments_bar = Logger::create_progress_bar(posts.len() as u64, "Fetching comments");
 
-    let comment_chunks =
-        try_join_all(posts_per_instance.into_iter().map(|(instance_id, posts)| {
-            let main_instance = &main_instance;
-            let instances = &instances;
-            let user_ids = &user_ids;
-            let comments_bar = &comments_bar;
-
-            async move {
-                stream::iter(posts)
-                    .map(|(&id, comment_count)| async move {
-                        if instance_id == main_instance.instance_info.id {
-                            main_instance.get_comments(id, comment_count).await
-                        } else {
-                            instances
-                                .get(&instance_id)
-                                .expect("Instances should be present")
-                                .get()
-                                .await?
-                                .get_comments(id, comment_count)
-                                .await
-                        }
-                    })
-                    .buffer_unordered(50)
-                    .inspect_ok(|_| comments_bar.inc())
-                    .flatten_ok()
-                    .and_then(|c| async move {
-                        if let Some(id) = c.creator_id().cloned() {
-                            _ = user_ids.insert_async(id).await;
-                        }
-
-                        Ok(c)
-                    })
-                    .try_collect::<Vec<_>>()
-                    .await
-            }
-        }))
-        .await?
-        .into_iter()
-        .flatten()
-        .chunks(100_000);
-
     let comment_count = {
         let mut comment_count = 0;
+        let comment_chunks =
+            join_all(posts_per_instance.into_iter().map(|(instance_id, posts)| {
+                let main_instance = &main_instance;
+                let instances = &instances;
+                let user_ids = &user_ids;
+                let comments_bar = &comments_bar;
+
+                async move {
+                    stream::iter(posts)
+                        .map(|(&id, comment_count)| async move {
+                            if instance_id == main_instance.instance_info.id {
+                                main_instance.get_comments(id, comment_count).await
+                            } else {
+                                let instance = match instances
+                                    .get(&instance_id)
+                                    .expect("Instances should be present")
+                                    .get()
+                                    .await {
+                                    Ok(instance) => instance,
+                                    Err(_) => {
+                                        log!(trace, "Instance not found: {:?}", instance_id);
+                                        return Vec::new()
+                                    }
+                                };
+
+                                instance
+                                    .get_comments(id, comment_count)
+                                    .await
+                            }
+                        })
+                        .buffer_unordered(50)
+                        .inspect(|_| comments_bar.inc())
+                        .flat_map(stream::iter)
+                        .then(|c| async move {
+                            if let Some(id) = c.creator_id().cloned() {
+                                _ = user_ids.insert_async(id).await;
+                            }
+
+                            c
+                        })
+                        .collect::<Vec<_>>()
+                        .await
+                }
+            }))
+            .await
+            .into_iter()
+            .inspect(|comments| comment_count += comments.len())
+            .flatten()
+            .chunks(100_000);
+
         for (i, chunk) in comment_chunks.into_iter().enumerate() {
             cli.write_csv(chunk, format!("comments_{}.csv", i).as_str())
-                .await?;
-            comment_count += 1;
+                .await.unwrap();
         }
 
         comment_count
@@ -295,8 +311,8 @@ async fn main() -> Result<()> {
             future_users.entry(id.clone()).or_insert_with(|| {
                 let id = id.clone();
                 async move {
-                    Ok::<_, Error>(if id.instance_id == main_instance.instance_info.id {
-                        Some(main_instance.get_user(id).await?)
+                    if id.instance_id == main_instance.instance_info.id {
+                        main_instance.get_user(id).await.ok() // Drop users where request fails
                     } else if let Some(instance) = instances.get(&id.instance_id) {
                         if let Ok(instance) = instance.get().await {
                             instance.get_user(id).await.ok() // Drop users where request fails
@@ -305,7 +321,7 @@ async fn main() -> Result<()> {
                         }
                     } else {
                         None
-                    })
+                    }
                 }
             });
         });
@@ -316,15 +332,15 @@ async fn main() -> Result<()> {
     let users = future_users
         .into_stream()
         .map(|(id, fut)| {
-            fut.map_ok(|u| {
+            fut.map(|u| {
                 let user = MaybeLemmyUser::from((&id, u));
                 (id, user)
             })
         })
         .buffer_unordered(200)
-        .inspect_ok(|_| users_bar.inc())
-        .try_collect::<HashMap<_, _>>()
-        .await?;
+        .inspect(|_| users_bar.inc())
+        .collect::<HashMap<_, _>>()
+        .await;
 
     users_bar.finish();
 
@@ -332,7 +348,7 @@ async fn main() -> Result<()> {
 
     for (i, chunk) in users.values().chunks(100_000).into_iter().enumerate() {
         cli.write_csv(chunk, format!("users_{}.csv", i).as_str())
-            .await?;
+            .await.unwrap();
     }
 
     let instances = instances
@@ -345,7 +361,5 @@ async fn main() -> Result<()> {
     let instance_infos = iter::once(&main_instance.instance_info)
         .chain(instances.values().map(|i| &i.instance_info));
 
-    cli.write_csv(instance_infos, "instances.csv").await?;
-
-    Ok(())
+    cli.write_csv(instance_infos, "instances.csv").await.unwrap();
 }

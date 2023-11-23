@@ -1,6 +1,6 @@
 use std::{
     env::current_dir,
-    path::PathBuf,
+    path::PathBuf, borrow::Cow,
 };
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
@@ -49,11 +49,11 @@ impl Cli {
         )
     }
 
-    pub fn logfile(&self) -> Result<PathBuf> {
-        Ok(self.logfile
+    pub fn logfile(&self) -> PathBuf {
+        self.logfile
             .as_ref()
-            .unwrap_or(&current_dir()?.join("lemmy-scraper.log"))
-            .to_owned())
+            .unwrap_or(&current_dir().unwrap().join("lemmy-scraper.log"))
+            .to_owned()
     }
 }
 
@@ -63,14 +63,15 @@ impl Cli {
         I: IntoIterator,
         I::Item: Serialize,
     {
-        let file_path = match self.output_dir.as_ref() {
-            Some(dir_path) => dir_path.join(filename),
-            None => {
-                let dir_path = current_dir()?.join("data");
-                fs::create_dir_all(&dir_path).await?;
-                dir_path.join(filename)
-            }
-        };
+        let dir_path = self.output_dir
+            .as_ref()
+            .map(Cow::Borrowed)
+            .map(Ok)
+            .unwrap_or_else(|| current_dir().map(|p| p.join("data")).map(Cow::Owned))?;
+
+        fs::create_dir_all(&*dir_path).await?;
+
+        let file_path = dir_path.join(filename);
 
         let mut writer = Writer::from_writer(vec![]);
 

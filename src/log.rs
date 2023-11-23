@@ -1,40 +1,54 @@
 use std::{
+    borrow::Cow,
     path::{Path, PathBuf},
-    sync::{mpsc, OnceLock, RwLock}, borrow::Cow,
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        mpsc, Arc, OnceLock, RwLock,
+    },
 };
 
 use indicatif::{ProgressBar as ProgressBarImpl, ProgressStyle};
 use tokio::{fs::File, io::AsyncWriteExt as _};
 
-
 type ProgressBarLock = RwLock<Option<ProgressBarImpl>>;
-
 
 static LOGGER: OnceLock<Logger> = OnceLock::new();
 
 pub struct Logger {
     progress_bar: ProgressBarLock,
     tx: mpsc::Sender<String>,
+    dropped: Arc<AtomicBool>,
 }
 
 impl Logger {
     fn new(logfile_path: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel::<String>();
-        tokio::spawn(async move {
-            let mut file = File::create(logfile_path).await.unwrap();
-            while let Ok(str) = rx.recv() {
-                file.write_all(str.as_bytes()).await.unwrap();
-                file.write_all(b"\n").await.unwrap();
-            }
-        });
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        {
+            let dropped = dropped.clone();
+            tokio::spawn(async move {
+                let mut file = File::create(logfile_path).await.unwrap();
+                while let (Ok(str), false) = (rx.recv(), dropped.load(AtomicOrdering::Relaxed)) {
+                    file.write_all(str.as_bytes()).await.unwrap();
+                    file.write_all(b"\n").await.unwrap();
+                }
+            });
+        }
+
         Self {
             progress_bar: RwLock::new(None),
             tx,
+            dropped,
         }
     }
 
-    pub fn initialize(logfile_path: impl AsRef<Path>) {
-        LOGGER.get_or_init(|| Self::new(logfile_path.as_ref().to_owned()));
+    pub fn initialize(logfile_path: impl AsRef<Path>) -> LoggerGuard {
+        let logger = LOGGER.get_or_init(|| Self::new(logfile_path.as_ref().to_owned()));
+
+        LoggerGuard {
+            dropped: logger.dropped.clone(),
+        }
     }
 
     pub fn get() -> &'static Self {
@@ -62,7 +76,9 @@ impl Logger {
         let mut guard = logger.progress_bar.write().unwrap();
 
         if guard.is_some() {
-            panic!("Progress bar already exists. Drop it using finish() before creating a new one.");
+            panic!(
+                "Progress bar already exists. Drop it using finish() before creating a new one."
+            );
         }
 
         *guard = Some(f());
@@ -86,6 +102,16 @@ impl Logger {
     }
 }
 
+pub struct LoggerGuard {
+    dropped: Arc<AtomicBool>,
+}
+
+impl Drop for LoggerGuard {
+    fn drop(&mut self) {
+        self.dropped.store(true, AtomicOrdering::Relaxed);
+    }
+}
+
 pub struct ProgressBar {
     progress_bar: &'static ProgressBarLock,
 }
@@ -95,14 +121,26 @@ impl ProgressBar {
         self.progress_bar.read().unwrap().as_ref().unwrap().inc(1);
     }
 
-    pub fn reduce_len(&self, difference: u64) {
-        self.progress_bar.read().unwrap().as_ref().unwrap().update(|state| {
-            let Some(previous_len) = state.len() else {
+    pub fn add_len(&self, difference: i64) {
+        let new_len: fn(_, i64) -> _ = match difference.cmp(&0) {
+            std::cmp::Ordering::Less => |len, diff| len - diff.unsigned_abs(),
+            std::cmp::Ordering::Greater => |len, diff| len + diff as u64,
+            std::cmp::Ordering::Equal => {
                 return;
-            };
+            }
+        };
+        self.progress_bar
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .update(|state| {
+                let Some(previous_len) = state.len() else {
+                    return;
+                };
 
-            state.set_len(previous_len - difference);
-        });
+                state.set_len(new_len(previous_len, difference));
+            });
     }
 
     pub fn finish(self) {}
